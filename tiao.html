@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>High-End Jump 3D</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            /* 柔和的渐变背景 */
+            background: linear-gradient(135deg, #e0c3fc 0%, #8ec5fc 100%);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            user-select: none;
+            -webkit-user-select: none;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        /* 极简分数显示 */
+        #score-panel {
+            position: absolute;
+            top: 50px;
+            left: 50px;
+            z-index: 10;
+        }
+        #score {
+            font-size: 60px;
+            font-weight: 800;
+            color: rgba(255, 255, 255, 0.9);
+            text-shadow: 0 10px 20px rgba(0,0,0,0.1);
+            line-height: 1;
+        }
+        #label {
+            font-size: 14px;
+            color: rgba(255, 255, 255, 0.8);
+            letter-spacing: 2px;
+            text-transform: uppercase;
+        }
+
+        /* 游戏结束界面 */
+        #game-over {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(255, 255, 255, 0.3);
+            backdrop-filter: blur(15px);
+            -webkit-backdrop-filter: blur(15px);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 20;
+            display: none;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+
+        #game-over.show {
+            display: flex;
+            opacity: 1;
+        }
+
+        h2 {
+            font-size: 40px;
+            color: #333;
+            margin-bottom: 30px;
+        }
+
+        button {
+            padding: 16px 48px;
+            font-size: 18px;
+            font-weight: 600;
+            color: white;
+            background: #333;
+            border: none;
+            border-radius: 100px;
+            cursor: pointer;
+            box-shadow: 0 15px 30px rgba(0,0,0,0.2);
+            transition: transform 0.1s, box-shadow 0.1s;
+        }
+        button:active {
+            transform: scale(0.96);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+
+        /* 蓄力条 (可选视觉辅助，为了美观这里用棋子变形代替，此处仅留作逻辑参考) */
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head>
+<body>
+
+<div id="score-panel">
+    <div id="score">0</div>
+    <div id="label">Score</div>
+</div>
+
+<div id="game-over">
+    <h2>Oops!</h2>
+    <button onclick="resetGame()">再试一次</button>
+</div>
+
+<script>
+    // --- 配置参数 ---
+    const CONFIG = {
+        cubeSize: 6,
+        cubeHeight: 3,
+        playerRadius: 1.2,
+        playerColor: 0x333333,
+        bgColor: 0xe0c3fc,
+        maxChargeTime: 800, // 毫秒，蓄力多久达到最大距离
+        maxDistance: 16,    // 最大能跳多远
+        minDistance: 3,     // 最小跳跃距离
+        gravity: 0.08       // 重力感
+    };
+
+    // --- 1. 场景初始化 ---
+    const scene = new THREE.Scene();
+
+    // 正交相机：为了获得完美的等轴测视图 (Iso View)
+    const aspect = window.innerWidth / window.innerHeight;
+    const d = 30;
+    const camera = new THREE.OrthographicCamera(-d * aspect, d * aspect, d, -d, 1, 1000);
+
+    // 经典的 2.5D 视角位置
+    camera.position.set(20, 30, 20);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true; // 开启阴影
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap; // 柔和阴影
+    renderer.setPixelRatio(window.devicePixelRatio); // 高清屏适配
+    document.body.appendChild(renderer.domElement);
+
+    // --- 2. 灯光系统 (画质关键) ---
+    // 环境光：模拟天光，照亮暗部
+    const hemiLight = new THREE.HemisphereLight(0xffffff, 0xffffff, 0.65);
+    scene.add(hemiLight);
+
+    // 平行光：模拟太阳，产生阴影
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.5);
+    dirLight.position.set(10, 50, 20);
+    dirLight.castShadow = true;
+    // 优化阴影范围和质量
+    dirLight.shadow.mapSize.width = 2048;
+    dirLight.shadow.mapSize.height = 2048;
+    const dLight = 40;
+    dirLight.shadow.camera.left = -dLight;
+    dirLight.shadow.camera.right = dLight;
+    dirLight.shadow.camera.top = dLight;
+    dirLight.shadow.camera.bottom = -dLight;
+    scene.add(dirLight);
+
+    // --- 3. 游戏状态 ---
+    let cubes = [];
+    let player;
+    let score = 0;
+    let state = 'idle'; // idle, charging, jumping, falling, end
+    let lastTime = 0;
+
+    // 蓄力相关
+    let chargeStartTime = 0;
+    let power = 0; // 0.0 - 1.0
+
+    // 物理向量
+    let velocity = new THREE.Vector3();
+
+    // 材质池 (莫兰迪色)
+    const colors = [0xff9ff3, 0xfeca57, 0xff6b6b, 0x48dbfb, 0x1dd1a1, 0x5f27cd, 0xc8d6e5];
+
+    // --- 4. 核心对象创建 ---
+
+    function createCube(x, z) {
+        // 使用 BoxGeometry，但在材质上做文章
+        const geometry = new THREE.BoxGeometry(CONFIG.cubeSize, CONFIG.cubeHeight, CONFIG.cubeSize);
+        // 随机颜色
+        const color = colors[Math.floor(Math.random() * colors.length)];
+        // MeshStandardMaterial 让光照更有质感
+        const material = new THREE.MeshStandardMaterial({
+            color: color,
+            roughness: 0.4, // 稍微有点反光
+            metalness: 0.1
+        });
+        const mesh = new THREE.Mesh(geometry, material);
+        mesh.position.set(x, 0, z);
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        scene.add(mesh);
+        cubes.push(mesh);
+        return mesh;
+    }
+
+    function createPlayer() {
+        const geometry = new THREE.CylinderGeometry(CONFIG.playerRadius * 0.8, CONFIG.playerRadius, 4, 32);
+        // 稍微上移 geometry 中心，方便缩放底部不动
+        geometry.translate(0, 2, 0);
+
+        const material = new THREE.MeshStandardMaterial({
+            color: CONFIG.playerColor,
+            roughness: 0.6
+        });
+        const mesh = new THREE.Mesh(geometry, material);
+        // 初始位置：Y轴要在方块上方
+        mesh.position.set(0, CONFIG.cubeHeight / 2, 0);
+        mesh.castShadow = true;
+        scene.add(mesh);
+        return mesh;
+    }
+
+    function createRipple(x, y, z) {
+        // 落地时的光圈
+        const geometry = new THREE.RingGeometry(0.5, 1, 32);
+        const material = new THREE.MeshBasicMaterial({
+            color: 0xffffff,
+            transparent: true,
+            opacity: 0.8,
+            side: THREE.DoubleSide
+        });
+        const mesh = new THREE.Mesh(geometry, material);
+        mesh.position.set(x, y + 0.1, z);
+        mesh.rotation.x = -Math.PI / 2;
+        scene.add(mesh);
+
+        // 简单的动画逻辑附加在对象上
+        mesh.userData = { scale: 1, opacity: 0.8 };
+
+        const animateRipple = () => {
+            if(!mesh.parent) return;
+            mesh.scale.setScalar(mesh.userData.scale);
+            mesh.material.opacity = mesh.userData.opacity;
+
+            mesh.userData.scale += 0.2;
+            mesh.userData.opacity -= 0.03;
+
+            if(mesh.userData.opacity <= 0) {
+                scene.remove(mesh);
+            } else {
+                requestAnimationFrame(animateRipple);
+            }
+        };
+        animateRipple();
+    }
+
+    // --- 5. 游戏逻辑 ---
+
+    function initGame() {
+        // 清理
+        cubes.forEach(c => scene.remove(c));
+        cubes = [];
+        if(player) scene.remove(player);
+        document.getElementById('game-over').classList.remove('show');
+
+        score = 0;
+        document.getElementById('score').innerText = score;
+
+        // 初始方块
+        createCube(0, 0);
+        // 第二个方块
+        addNextCube();
+
+        player = createPlayer();
+
+        // 相机重置
+        camera.position.set(20, 30, 20);
+        camera.lookAt(0, 0, 0);
+
+        state = 'idle';
+    }
+
+    function addNextCube() {
+        const lastCube = cubes[cubes.length - 1];
+        const direction = Math.random() > 0.5 ? 'x' : 'z';
+        // 距离控制：确保不会太近也不会太远
+        const dist = CONFIG.cubeSize * 1.5 + Math.random() * (CONFIG.maxDistance - CONFIG.cubeSize * 1.5 - 2);
+
+        const x = lastCube.position.x + (direction === 'x' ? -dist : 0);
+        const z = lastCube.position.z + (direction === 'z' ? -dist : 0);
+
+        createCube(x, z);
+
+        // 内存优化：只保留最近的5个方块
+        if(cubes.length > 6) {
+            scene.remove(cubes.shift());
+        }
+    }
+
+    // --- 交互控制 ---
+    const onStart = (e) => {
+        if (state !== 'idle') return;
+        e.preventDefault(); // 防止触摸滚动
+        state = 'charging';
+        chargeStartTime = Date.now();
+    };
+
+    const onEnd = (e) => {
+        if (state !== 'charging') return;
+        state = 'jumping';
+
+        const duration = Date.now() - chargeStartTime;
+        // 限制蓄力值 0 ~ 1
+        let ratio = Math.min(duration / CONFIG.maxChargeTime, 1);
+
+        // 恢复形状
+        player.scale.set(1, 1, 1);
+        player.material.color.setHex(CONFIG.playerColor); // 恢复颜色
+
+        // 计算跳跃力度
+        // 修复重点：力度映射更平滑
+        // 跳跃距离 = 最小距离 + 比例 * (最大距离 - 最小距离)
+        const jumpDist = CONFIG.minDistance + ratio * (CONFIG.maxDistance - CONFIG.minDistance);
+
+        // 判断方向：总是跳向下一个方块的方向
+        const currCube = cubes[cubes.length - 2];
+        const nextCube = cubes[cubes.length - 1];
+
+        // 计算方向向量
+        let dir = new THREE.Vector3().subVectors(nextCube.position, currCube.position).normalize();
+
+        // 如果玩家稍微偏离了中心，也要修正一下跳跃起始点，这里简单处理沿轴跳跃
+        // 实际上为了游戏乐趣，方向应该是固定的轴向 (X 或 Z)
+        if (Math.abs(nextCube.position.x - currCube.position.x) > Math.abs(nextCube.position.z - currCube.position.z)) {
+            // X轴方向
+            velocity.set(-1, 0, 0);
+        } else {
+            // Z轴方向
+            velocity.set(0, 0, -1);
+        }
+
+        // 分解速度
+        // 水平速度 = 距离 / 飞行时间
+        // 我们设定一个固定的弹跳高度或者根据距离调整高度
+        // 简单的抛物线物理：
+        // Vy (垂直初速度) 决定飞行时间
+        const jumpHeight = 6; // 跳起高度
+        const Vy = Math.sqrt(2 * CONFIG.gravity * jumpHeight); // v^2 = 2gh
+
+        // 飞行总时间 = 2 * Vy / g
+        const flightTime = 2 * Vy / CONFIG.gravity; // 这里是用帧数近似的物理，简化处理
+
+        // 实际上，我们在 update 中模拟：
+        // y += vy; vy -= g;
+        // 所以我们需要给一个初始 vy，和一个水平 vx/vz
+
+        velocity.multiplyScalar(jumpDist / 25); // 水平速度系数 (需微调以匹配重力)
+        // 重新计算精确物理：
+        // 我们希望落地时正好移动了 jumpDist
+        // 假设模拟步长是1单位时间
+        // 这里我们采用简化的"伪物理"来保证手感
+        // 设定一个向上的初始速度，和一个恒定的水平速度
+
+        velocity.y = 0.6; // 固定的垂直爆发力 (或者随蓄力微增)
+        // 水平速度 = 距离 * 系数
+        // 经过测试，系数 0.035 配合 重力 0.025 比较舒服
+        // 现在的重力是 0.08 (CONFIG.gravity)
+
+        // 重写物理公式：
+        // Y方向运动：y = v0*t - 0.5*g*t^2. 落地时间 t_end = 2*v0/g
+        // X方向运动：x = vx * t_end = vx * 2*v0/g
+        // 所以 vx = x * g / (2*v0)
+
+        const v0_y = 0.8; // 垂直初速度固定，保证跳跃高度一致，只改变远近
+        const t_flight = 2 * v0_y / CONFIG.gravity;
+        const v_horizontal = jumpDist / t_flight;
+
+        velocity.normalize().multiplyScalar(v_horizontal);
+        velocity.y = v0_y;
+    };
+
+    window.addEventListener('mousedown', onStart);
+    window.addEventListener('mouseup', onEnd);
+    window.addEventListener('touchstart', onStart, {passive: false});
+    window.addEventListener('touchend', onEnd);
+
+
+    // --- 6. 核心循环 ---
+    function animate() {
+        requestAnimationFrame(animate);
+
+        // 1. 蓄力动画
+        if (state === 'charging') {
+            const duration = Date.now() - chargeStartTime;
+            const ratio = Math.min(duration / CONFIG.maxChargeTime, 1);
+
+            // 压扁效果 (Y轴变短，XZ变胖)
+            // 限制最大压扁程度，防止扁成纸
+            const scaleY = 1 - ratio * 0.4;
+            const scaleXZ = 1 + ratio * 0.2;
+            player.scale.set(scaleXZ, scaleY, scaleXZ);
+
+            // 颜色变红反馈力度
+            player.material.color.setHSL(0, 0, 0.2 + ratio * 0.5);
+        }
+
+        // 2. 跳跃物理
+        if (state === 'jumping') {
+            player.position.add(velocity);
+            velocity.y -= CONFIG.gravity; // 重力应用
+
+            // 空中旋转 (让动作更生动)
+            player.rotation.z -= velocity.x * 0.2;
+            player.rotation.x += velocity.z * 0.2;
+
+            // 落地检测
+            // 只有当Y速度向下，且位置低于平台表面时检测
+            if (velocity.y < 0 && player.position.y <= CONFIG.cubeHeight / 2) {
+                player.position.y = CONFIG.cubeHeight / 2;
+                player.rotation.set(0,0,0); // 重置旋转
+                checkLanding();
+            }
+        }
+
+        // 3. 掉落动画
+        if (state === 'falling') {
+            player.position.y -= 0.5;
+            player.rotation.x += 0.1;
+            player.rotation.z += 0.1;
+            if (player.position.y < -20) {
+                state = 'end';
+                document.getElementById('game-over').classList.add('show');
+            }
+        }
+
+        // 4. 相机跟随 (平滑阻尼)
+        if (player) {
+            // 目标位置：保持相对距离
+            const targetX = player.position.x + 20;
+            const targetZ = player.position.z + 20;
+
+            // Lerp 插值
+            camera.position.x += (targetX - camera.position.x) * 0.1;
+            camera.position.z += (targetZ - camera.position.z) * 0.1;
+            camera.lookAt(player.position.x, 0, player.position.z); // 让相机始终看着玩家
+        }
+
+        renderer.render(scene, camera);
+    }
+
+    function checkLanding() {
+        const currCube = cubes[cubes.length - 2];
+        const nextCube = cubes[cubes.length - 1];
+
+        // 计算与两个平台的距离
+        const distToNext = Math.sqrt(
+            Math.pow(player.position.x - nextCube.position.x, 2) +
+            Math.pow(player.position.z - nextCube.position.z, 2)
+        );
+        const distToCurr = Math.sqrt(
+            Math.pow(player.position.x - currCube.position.x, 2) +
+            Math.pow(player.position.z - currCube.position.z, 2)
+        );
+
+        const tolerance = CONFIG.cubeSize / 2 + CONFIG.playerRadius - 1; // 容错半径
+
+        if (distToNext < tolerance) {
+            // 成功跳到下一个
+            score++;
+            document.getElementById('score').innerText = score;
+            state = 'idle';
+
+            // 落地特效
+            createRipple(player.position.x, player.position.y, player.position.z);
+
+            // 中心奖励：如果非常准，可以加更多分或特效（这里简化）
+            if (distToNext < 1) {
+                // Perfect!
+                player.material.color.setHex(0xffffff); // 闪一下白
+                setTimeout(() => player.material.color.setHex(CONFIG.playerColor), 200);
+            }
+
+            addNextCube();
+        } else if (distToCurr < tolerance) {
+            // 原地落下
+            state = 'idle';
+        } else {
+            // 掉下去了
+            state = 'falling';
+        }
+    }
+
+    function resetGame() {
+        initGame();
+    }
+
+    // 启动
+    initGame();
+    animate();
+
+    // 窗口适配
+    window.addEventListener('resize', () => {
+        const aspect = window.innerWidth / window.innerHeight;
+        camera.left = -d * aspect;
+        camera.right = d * aspect;
+        camera.top = d;
+        camera.bottom = -d;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+</script>
+</body>
+</html>
